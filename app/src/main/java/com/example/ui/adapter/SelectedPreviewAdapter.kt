@@ -30,7 +30,8 @@ class SelectedPreviewAdapter(
             val ctx = binding.root.context
             binding.tvPreviewName.text = emote.name
             binding.btnRemovePreview.contentDescription = ctx.getString(R.string.remove_emote_cd, emote.name)
-            binding.ivPreviewEmote.load(emote.previewUrl) {
+            val localFile = emote.localPreviewPath?.let { java.io.File(it) }?.takeIf { it.exists() }
+            binding.ivPreviewEmote.load(localFile ?: emote.previewUrl) {
                 placeholder(R.drawable.ic_emoji)
                 error(R.drawable.ic_emoji)
             }

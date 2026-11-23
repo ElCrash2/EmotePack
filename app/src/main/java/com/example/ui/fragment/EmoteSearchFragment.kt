@@ -16,6 +16,7 @@ import com.example.AppNavigator
 import com.example.R
 import com.example.databinding.FragmentEmoteGridBinding
 import com.example.ui.adapter.EmoteGridAdapter
+import com.example.ui.state.ToggleSelectionResult
 import com.example.ui.viewmodel.EmoteGridViewModel
 import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.flow.combine
@@ -43,7 +44,6 @@ class EmoteSearchFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        // Show inline search bar so user can refine searches (especially useful when editing a collection!)
         binding.inlineSearchBar.visibility = View.VISIBLE
         binding.etInlineQuery.setText(initialQuery)
         binding.btnInlineSearch.setOnClickListener { runInlineSearch() }
@@ -57,12 +57,14 @@ class EmoteSearchFragment : Fragment() {
         val spanCount = maxOf(3, resources.configuration.screenWidthDp / 115)
         val gridLayoutManager = GridLayoutManager(requireContext(), spanCount)
         emoteAdapter = EmoteGridAdapter { emote ->
-            viewModel.session.toggleEmote(emote)
+            if (viewModel.session.toggleEmote(emote) == ToggleSelectionResult.LIMIT_REACHED) {
+                showMaxLimitSnackbar()
+            }
         }
         binding.rvEmotesGrid.layoutManager = gridLayoutManager
         binding.rvEmotesGrid.adapter = emoteAdapter
 
-        // Progressive pagination when scrolling near bottom
+        // Progressive 30-emote pagination when scrolling near bottom
         binding.rvEmotesGrid.addOnScrollListener(object : RecyclerView.OnScrollListener() {
             override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
                 if (dy <= 0) return
@@ -75,7 +77,10 @@ class EmoteSearchFragment : Fragment() {
         })
 
         binding.btnSelectAll.setOnClickListener {
-            viewModel.toggleSelectAllGlobal()
+            val res = viewModel.selectFirst30()
+            if (res.limitReached) {
+                showMaxLimitSnackbar()
+            }
         }
 
         binding.btnRetryEmotes.setOnClickListener {
@@ -88,6 +93,10 @@ class EmoteSearchFragment : Fragment() {
         }
 
         observeState()
+    }
+
+    private fun showMaxLimitSnackbar() {
+        Snackbar.make(binding.root, R.string.max_30_stickers_reached, Snackbar.LENGTH_SHORT).show()
     }
 
     private fun runInlineSearch() {
@@ -142,13 +151,10 @@ class EmoteSearchFragment : Fragment() {
                     emoteAdapter.updateSelection(selectedMap.keys)
 
                     binding.tvSelectedCount.text = getString(R.string.selected_count_format, selectedMap.size)
-                    val allSelected = state.displayedEmotes.isNotEmpty() &&
-                        !state.hasMorePages &&
-                        state.displayedEmotes.all { selectedMap.containsKey(it.id) }
-                    binding.btnSelectAll.setText(if (allSelected) R.string.deselect_all else R.string.select_all)
+                    binding.btnSelectAll.setText(R.string.select_first_30)
 
                     binding.progressGlobalSelect.visibility =
-                        if (state.isSelectingAllPages || state.isLoadingMore) View.VISIBLE else View.GONE
+                        if (state.isLoadingMore) View.VISIBLE else View.GONE
 
                     binding.progressEmotes.visibility = if (state.isLoading) View.VISIBLE else View.GONE
                     val showEmptyOrError = !state.isLoading && (state.errorMessage != null || state.displayedEmotes.isEmpty())

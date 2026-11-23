@@ -10,11 +10,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import coil.load
 import com.example.AppNavigator
 import com.example.R
 import com.example.databinding.FragmentEmoteGridBinding
 import com.example.ui.adapter.EmoteGridAdapter
+import com.example.ui.state.ToggleSelectionResult
+import com.example.ui.viewmodel.EmoteGridUiState
 import com.example.ui.viewmodel.EmoteGridViewModel
 import com.google.android.material.chip.Chip
 import com.google.android.material.snackbar.Snackbar
@@ -28,7 +31,7 @@ class StreamerEmotesFragment : Fragment() {
     private val viewModel: EmoteGridViewModel by viewModels()
 
     private lateinit var emoteAdapter: EmoteGridAdapter
-    private var renderedSetIds: List<String> = emptyList()
+    private var renderedSetSignature: List<String> = emptyList()
 
     private val userId: String by lazy { requireArguments().getString(ARG_USER_ID).orEmpty() }
     private val displayName: String by lazy { requireArguments().getString(ARG_DISPLAY_NAME).orEmpty() }
@@ -61,14 +64,32 @@ class StreamerEmotesFragment : Fragment() {
         }
 
         val spanCount = maxOf(3, resources.configuration.screenWidthDp / 115)
+        val gridLayoutManager = GridLayoutManager(requireContext(), spanCount)
         emoteAdapter = EmoteGridAdapter { emote ->
-            viewModel.session.toggleEmote(emote)
+            if (viewModel.session.toggleEmote(emote) == ToggleSelectionResult.LIMIT_REACHED) {
+                showMaxLimitSnackbar()
+            }
         }
-        binding.rvEmotesGrid.layoutManager = GridLayoutManager(requireContext(), spanCount)
+        binding.rvEmotesGrid.layoutManager = gridLayoutManager
         binding.rvEmotesGrid.adapter = emoteAdapter
 
+        // Progressive 30-emote reveal on scroll for streamer sets
+        binding.rvEmotesGrid.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                if (dy <= 0) return
+                val totalItems = gridLayoutManager.itemCount
+                val lastVisible = gridLayoutManager.findLastVisibleItemPosition()
+                if (totalItems > 0 && lastVisible >= totalItems - 9) {
+                    viewModel.loadNextStreamerPage()
+                }
+            }
+        })
+
         binding.btnSelectAll.setOnClickListener {
-            viewModel.toggleSelectAllGlobal()
+            val res = viewModel.selectFirst30()
+            if (res.limitReached) {
+                showMaxLimitSnackbar()
+            }
         }
 
         binding.btnRetryEmotes.setOnClickListener {
@@ -80,6 +101,10 @@ class StreamerEmotesFragment : Fragment() {
         }
 
         observeState()
+    }
+
+    private fun showMaxLimitSnackbar() {
+        Snackbar.make(binding.root, R.string.max_30_stickers_reached, Snackbar.LENGTH_SHORT).show()
     }
 
     private fun observeState() {
@@ -120,10 +145,9 @@ class StreamerEmotesFragment : Fragment() {
                         }
                     )
 
-                    // Populate Emote Set filter chips when loaded
-                    val setIds = state.emoteSets.map { it.id }
-                    if (setIds != renderedSetIds) {
-                        renderedSetIds = setIds
+                    val setSignature = state.emoteSets.map { "${it.id}:${it.emotes.size}:${state.activeSetId == it.id}" }
+                    if (setSignature != renderedSetSignature) {
+                        renderedSetSignature = setSignature
                         renderSetChips(state)
                     }
 
@@ -131,12 +155,13 @@ class StreamerEmotesFragment : Fragment() {
                     emoteAdapter.updateSelection(selectedMap.keys)
 
                     binding.tvSelectedCount.text = getString(R.string.selected_count_format, selectedMap.size)
-                    val allSelected = state.displayedEmotes.isNotEmpty() &&
-                        state.displayedEmotes.all { selectedMap.containsKey(it.id) }
-                    binding.btnSelectAll.setText(if (allSelected) R.string.deselect_all else R.string.select_all)
+                    binding.btnSelectAll.setText(R.string.select_first_30)
+                    binding.progressGlobalSelect.visibility =
+                        if (state.isLoadingSet || state.isLoadingMore) View.VISIBLE else View.GONE
 
                     binding.progressEmotes.visibility = if (state.isLoading) View.VISIBLE else View.GONE
-                    val showEmptyOrError = !state.isLoading && (state.errorMessage != null || state.displayedEmotes.isEmpty())
+                    val showEmptyOrError = !state.isLoading && !state.isLoadingSet &&
+                        (state.errorMessage != null || state.displayedEmotes.isEmpty())
                     binding.emptyErrorContainer.visibility = if (showEmptyOrError) View.VISIBLE else View.GONE
                     if (state.errorMessage != null) {
                         binding.tvEmotesStatus.text = if (state.isNetworkError) {
@@ -145,7 +170,7 @@ class StreamerEmotesFragment : Fragment() {
                             getString(R.string.error_api, state.errorMessage)
                         }
                         binding.btnRetryEmotes.visibility = View.VISIBLE
-                    } else if (state.displayedEmotes.isEmpty() && !state.isLoading) {
+                    } else if (state.displayedEmotes.isEmpty() && !state.isLoading && !state.isLoadingSet) {
                         binding.tvEmotesStatus.setText(R.string.no_emotes_found)
                         binding.btnRetryEmotes.visibility = View.GONE
                     }
@@ -154,14 +179,14 @@ class StreamerEmotesFragment : Fragment() {
         }
     }
 
-    private fun renderSetChips(state: com.example.ui.viewmodel.EmoteGridUiState) {
+    private fun renderSetChips(state: EmoteGridUiState) {
         val group = binding.chipGroupSets
         group.removeAllViews()
 
-        val totalUnique = state.emoteSets.flatMap { it.emotes }.distinctBy { it.id }.size
+        val totalLoadedUnique = state.emoteSets.flatMap { it.emotes }.distinctBy { it.id }.size
         val allChip = Chip(requireContext()).apply {
             id = View.generateViewId()
-            text = getString(R.string.filter_all_sets, totalUnique)
+            text = getString(R.string.filter_all_sets, totalLoadedUnique)
             isCheckable = true
             isChecked = state.activeSetId == null
             setOnClickListener { viewModel.selectEmoteSetFilter(null) }
@@ -171,7 +196,7 @@ class StreamerEmotesFragment : Fragment() {
         state.emoteSets.forEach { set ->
             val chip = Chip(requireContext()).apply {
                 id = View.generateViewId()
-                text = "${set.name} (${set.emotes.size})"
+                text = if (set.emotes.isNotEmpty()) "${set.name} (${set.emotes.size})" else set.name
                 isCheckable = true
                 isChecked = state.activeSetId == set.id
                 setOnClickListener { viewModel.selectEmoteSetFilter(set.id) }

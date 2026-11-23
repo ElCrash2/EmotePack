@@ -39,7 +39,11 @@ interface AppNavigator {
     fun openEmoteSearch(query: String, startFreshSession: Boolean = true)
     fun openCreateCollection(suggestedName: String)
     fun openBuildProgress(collectionId: String)
-    fun openCollectionDetail(collectionId: String)
+    fun openCollectionDetail(
+        collectionId: String,
+        isCreationSummary: Boolean = false,
+        popCurrentProcessing: Boolean = false
+    )
     fun openEditFromOrigin(origin: SearchOrigin)
     fun configureToolbar(
         title: String? = null,
@@ -223,8 +227,15 @@ class MainActivity : AppCompatActivity(), AppNavigator {
         pushFragment(CreateCollectionFragment.newForExistingBuild(collectionId))
     }
 
-    override fun openCollectionDetail(collectionId: String) {
-        pushFragment(CollectionDetailFragment.newInstance(collectionId))
+    override fun openCollectionDetail(
+        collectionId: String,
+        isCreationSummary: Boolean,
+        popCurrentProcessing: Boolean
+    ) {
+        if (popCurrentProcessing && supportFragmentManager.backStackEntryCount > 0) {
+            supportFragmentManager.popBackStack()
+        }
+        pushFragment(CollectionDetailFragment.newInstance(collectionId, isCreationSummary))
     }
 
     override fun openEditFromOrigin(origin: SearchOrigin) {

@@ -2,15 +2,17 @@ package com.example.data.local
 
 import android.content.Context
 import android.net.Uri
+import com.example.AppConfig
 import com.example.conversion.StickerConverter
 import com.example.data.model.SearchOrigin
 import com.example.data.model.SevenTvEmote
-import com.example.whatsapp.SubpackBuilder
+import com.example.whatsapp.WhatsAppPackBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class CollectionRepository(
     private val context: Context,
@@ -21,6 +23,14 @@ class CollectionRepository(
     private val collectionDao = db.collectionDao()
     private val itemDao = db.stickerItemDao()
     private val subpackDao = db.subpackDao()
+    private val emoteCacheDao = db.emoteCacheDao()
+
+    /**
+     * Holds pre-edit snapshots so "Cancel creation" / "Cancelar creación" while editing
+     * reverts the collection back to its exact previous state without touching shared cache.
+     */
+    private val editSnapshots = ConcurrentHashMap<String, CollectionWithDetails>()
+    private val activeEditIds = ConcurrentHashMap.newKeySet<String>()
 
     fun observeAllCollections(): Flow<List<StickerCollectionEntity>> =
         collectionDao.observeAllCollections()
@@ -43,6 +53,20 @@ class CollectionRepository(
     suspend fun getCompletedStickersForSubpack(subpackId: String): List<StickerItemEntity> =
         itemDao.getCompletedItemsForSubpack(subpackId)
 
+    suspend fun getEmoteCache(cacheKey: String): EmoteCacheEntity? =
+        emoteCacheDao.getByCacheKey(cacheKey)
+
+    suspend fun getLatestEmoteCache(emoteId: String): EmoteCacheEntity? =
+        emoteCacheDao.getLatestForEmote(emoteId)
+
+    suspend fun upsertEmoteCache(entry: EmoteCacheEntity) {
+        emoteCacheDao.upsert(entry)
+    }
+
+    suspend fun touchEmoteCache(cacheKey: String, timestamp: Long = System.currentTimeMillis()) {
+        emoteCacheDao.touch(cacheKey, timestamp)
+    }
+
     suspend fun markSubpackAddedToWhatsApp(subpackId: String, added: Boolean) {
         subpackDao.markAddedToWhatsApp(subpackId, added)
     }
@@ -51,8 +75,8 @@ class CollectionRepository(
         collectionDao.getAllCollectionsWithDetails().size
 
     /**
-     * Prepares a new or edited collection in Room before starting background WorkManager conversion.
-     * During an edit, existing valid local WebP files are preserved and reused without re-downloading!
+     * Prepares a new or edited single-pack collection (max 30 stickers) in Room before starting
+     * background WorkManager conversion. Reuses valid shared-cache variants & preserved edits.
      */
     suspend fun prepareCollectionBuild(
         existingCollectionId: String?,
@@ -61,50 +85,133 @@ class CollectionRepository(
         selectedEmotes: List<SevenTvEmote>
     ): String = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
+        val cappedEmotes = selectedEmotes.take(AppConfig.MAX_STICKERS_PER_COLLECTION)
         val collectionId = existingCollectionId ?: UUID.randomUUID().toString()
         val existing = if (existingCollectionId != null) {
             collectionDao.getCollectionWithDetails(existingCollectionId)
         } else null
 
+        if (existing != null && !editSnapshots.containsKey(collectionId)) {
+            editSnapshots[collectionId] = existing
+            activeEditIds.add(collectionId)
+        }
+
+        val packHasAnyAnimated = cappedEmotes.any { it.animated }
         val existingItemsByEmoteId = existing?.items?.associateBy { it.emoteId } ?: emptyMap()
 
-        val itemsToSave = selectedEmotes.mapIndexed { index, emote ->
+        val itemsToSave = cappedEmotes.mapIndexed { index, emote ->
+            val targetMode = WhatsAppPackBuilder.targetConversionMode(
+                isEmoteAnimated = emote.animated,
+                packHasAnyAnimated = packHasAnyAnimated
+            )
+            val expectAnimatedFile = targetMode != ConversionModeType.STATIC
+            val effectiveUpdatedAt = emote.updatedAt
+            val effectiveVersionKey = emote.versionKey
+            val cacheKey = "${emote.id}_$effectiveVersionKey"
             val prev = existingItemsByEmoteId[emote.id]
-            val prevFile = prev?.finalWebpPath?.let { File(it) }
-            if (prev != null &&
-                prev.status == ItemConversionStatus.COMPLETED &&
-                prevFile != null &&
-                StickerConverter.validateExistingWebp(prevFile, prev.isAnimated) != null
-            ) {
-                prev.copy(
-                    sortOrder = index,
-                    emoteName = emote.name
-                )
-            } else {
+
+            // 1. Check global shared cache for exact emote + version + target mode + converter version
+            val cacheEntry = emoteCacheDao.getByCacheKey(cacheKey)
+                ?: if (effectiveUpdatedAt == 0L) emoteCacheDao.getLatestForEmote(emote.id) else null
+
+            val cachedVariantPath = if (cacheEntry != null && cacheEntry.converterVersion == AppConfig.CONVERTER_VERSION) {
+                when (targetMode) {
+                    ConversionModeType.STATIC -> cacheEntry.staticWebpPath
+                    ConversionModeType.ANIMATED -> cacheEntry.animatedWebpPath
+                    ConversionModeType.FAKE_VID -> cacheEntry.fakeVidWebpPath
+                    else -> null
+                }
+            } else null
+
+            val cachedVariantFile = cachedVariantPath?.let(::File)
+            val cachedInfo = if (cachedVariantFile != null && cachedVariantFile.exists()) {
+                StickerConverter.validateExistingWebp(cachedVariantFile, expectAnimatedFile)
+            } else null
+
+            if (cachedInfo != null && cachedVariantFile != null && cacheEntry != null) {
+                emoteCacheDao.touch(cacheEntry.cacheKey, now)
                 StickerItemEntity(
                     id = prev?.id ?: UUID.randomUUID().toString(),
                     collectionId = collectionId,
                     emoteId = emote.id,
                     emoteName = emote.name,
-                    sourceSetId = emote.sourceSetId,
-                    sourceSetName = emote.sourceSetName,
+                    sourceSetId = emote.sourceSetId ?: prev?.sourceSetId,
+                    sourceSetName = emote.sourceSetName ?: prev?.sourceSetName,
                     isAnimated = emote.animated,
                     previewUrl = emote.previewUrl,
                     highResUrl = emote.highResUrl,
                     fallbackUrlsCsv = emote.fallbackUrls.joinToString("|"),
-                    finalWebpPath = null,
+                    finalWebpPath = cachedVariantFile.absolutePath,
                     stickerFileName = "sticker_${emote.id}.webp",
-                    fileSizeBytes = 0L,
-                    width = 0,
-                    height = 0,
-                    frameCount = 0,
-                    durationMs = 0,
-                    hasAlpha = true,
-                    status = ItemConversionStatus.PENDING,
+                    fileSizeBytes = cachedVariantFile.length(),
+                    width = cachedInfo.width,
+                    height = cachedInfo.height,
+                    frameCount = cachedInfo.frameCount,
+                    durationMs = cachedInfo.totalDurationMs,
+                    hasAlpha = cachedInfo.hasAlpha,
+                    status = ItemConversionStatus.COMPLETED,
                     errorMessage = null,
                     subpackId = null,
-                    sortOrder = index
+                    sortOrder = index,
+                    versionUpdatedAt = effectiveUpdatedAt,
+                    versionKey = effectiveVersionKey,
+                    conversionMode = targetMode
                 )
+            } else {
+                // 2. Fallback: reuse existing valid local file on the edited collection if version & mode match
+                val prevFile = prev?.finalWebpPath?.let(::File)
+                val sameVersion = prev != null &&
+                    (effectiveUpdatedAt == 0L || prev.versionUpdatedAt == effectiveUpdatedAt)
+                val prevValidInfo = if (
+                    prev != null &&
+                    sameVersion &&
+                    prev.status == ItemConversionStatus.COMPLETED &&
+                    prev.conversionMode == targetMode &&
+                    prevFile != null &&
+                    prevFile.exists()
+                ) {
+                    StickerConverter.validateExistingWebp(prevFile, expectAnimatedFile)
+                } else null
+
+                if (prev != null && prevValidInfo != null) {
+                    prev.copy(
+                        sortOrder = index,
+                        emoteName = emote.name,
+                        status = ItemConversionStatus.COMPLETED,
+                        errorMessage = null
+                    )
+                } else {
+                    // Carry over any old local path in finalWebpPath ONLY if status is PENDING
+                    //? Better: Worker can consult prev's path or cacheEntry.originalFilePath cleanly via DB/cache,
+                    // keeping finalWebpPath = prevFile if still exists for fallback offline conversion.
+                    StickerItemEntity(
+                        id = prev?.id ?: UUID.randomUUID().toString(),
+                        collectionId = collectionId,
+                        emoteId = emote.id,
+                        emoteName = emote.name,
+                        sourceSetId = emote.sourceSetId ?: prev?.sourceSetId,
+                        sourceSetName = emote.sourceSetName ?: prev?.sourceSetName,
+                        isAnimated = emote.animated,
+                        previewUrl = emote.previewUrl,
+                        highResUrl = emote.highResUrl,
+                        fallbackUrlsCsv = emote.fallbackUrls.joinToString("|"),
+                        finalWebpPath = prevFile?.takeIf { it.exists() }?.absolutePath,
+                        stickerFileName = "sticker_${emote.id}.webp",
+                        fileSizeBytes = 0L,
+                        width = 0,
+                        height = 0,
+                        frameCount = 0,
+                        durationMs = 0,
+                        hasAlpha = true,
+                        status = ItemConversionStatus.PENDING,
+                        errorMessage = null,
+                        subpackId = null,
+                        sortOrder = index,
+                        versionUpdatedAt = effectiveUpdatedAt,
+                        versionKey = effectiveVersionKey,
+                        conversionMode = targetMode
+                    )
+                }
             }
         }
 
@@ -124,11 +231,11 @@ class CollectionRepository(
             totalCount = itemsToSave.size,
             animatedCount = itemsToSave.count { it.isAnimated },
             staticCount = itemsToSave.count { !it.isAnimated },
-            status = CollectionStatus.PROCESSING
+            status = CollectionStatus.PROCESSING,
+            isAnimatedPack = packHasAnyAnimated
         )
 
         collectionDao.upsert(entity)
-        // Note: on edit, remove removed items from DB only (do NOT delete old files until rebuild completes!)
         val keepIds = itemsToSave.map { it.id }.toSet()
         val removedIds = existing?.items?.filter { it.id !in keepIds }?.map { it.id }.orEmpty()
         if (removedIds.isNotEmpty()) {
@@ -176,45 +283,46 @@ class CollectionRepository(
             return@withContext
         }
 
-        val buildResult = SubpackBuilder.buildSubpacks(
-            context = context,
+        val buildResult = WhatsAppPackBuilder.buildSinglePack(
             storage = storage,
             collectionId = collectionId,
             collectionName = details.collection.name,
             completedItems = completed,
-            existingSubpacks = details.subpacks
+            existingPacks = details.subpacks
         )
 
         subpackDao.deleteForCollection(collectionId)
-        subpackDao.insertAll(buildResult.subpacks)
+        val builtPack = buildResult.pack
+        if (builtPack != null) {
+            subpackDao.insertAll(listOf(builtPack))
+        }
         if (buildResult.updatedItems.isNotEmpty()) {
             itemDao.insertAll(buildResult.updatedItems)
         }
 
-        // Now safely clean up orphaned files after new stickers and subpacks are validated!
         val activeStickerPaths = completed.mapNotNull { it.finalWebpPath }.toSet()
-        val activeTrayPaths = buildResult.subpacks.map { it.trayIconPath }.toSet()
+        val activeTrayPaths = builtPack?.trayIconPath?.let(::setOf) ?: emptySet()
         storage.cleanupUnusedStickers(collectionId, activeStickerPaths, activeTrayPaths)
 
         val hasWarnings = details.items.any {
             it.status == ItemConversionStatus.FAILED || it.status == ItemConversionStatus.NEEDS_TRIM
         }
-        val anyReadySubpack = buildResult.subpacks.any { it.isWhatsAppReady }
         val finalStatus = when {
             cancelled -> CollectionStatus.CANCELLED
             hasWarnings -> CollectionStatus.PARTIAL_ERROR
-            !anyReadySubpack -> CollectionStatus.DRAFT_TOO_FEW
+            builtPack == null || !builtPack.isWhatsAppReady -> CollectionStatus.DRAFT_TOO_FEW
             else -> CollectionStatus.READY
         }
 
         collectionDao.upsert(
             details.collection.copy(
                 updatedAt = System.currentTimeMillis(),
-                trayIconPath = buildResult.subpacks.firstOrNull()?.trayIconPath,
+                trayIconPath = builtPack?.trayIconPath,
                 totalCount = completed.size,
                 animatedCount = completed.count { it.isAnimated },
                 staticCount = completed.count { !it.isAnimated },
-                status = finalStatus
+                status = finalStatus,
+                isAnimatedPack = buildResult.isAnimatedPack
             )
         )
     }
@@ -223,9 +331,57 @@ class CollectionRepository(
         itemDao.update(item)
     }
 
+    fun hasPendingEditSnapshot(collectionId: String): Boolean =
+        activeEditIds.contains(collectionId)
+
+    fun commitCreationSummary(collectionId: String) {
+        editSnapshots.remove(collectionId)
+        activeEditIds.remove(collectionId)
+    }
+
+    /**
+     * Discards a newly created pack/draft OR reverts an active edit back to the pre-edit state.
+     * Shared cache files remain untouched for reuse and for other collections.
+     */
+    suspend fun discardCreationOrRevertEdit(collectionId: String) = withContext(Dispatchers.IO) {
+        val snapshot = editSnapshots.remove(collectionId)
+        val wasEdit = activeEditIds.remove(collectionId)
+        if (wasEdit && snapshot != null) {
+            collectionDao.upsert(snapshot.collection)
+            itemDao.deleteForCollection(collectionId)
+            itemDao.insertAll(snapshot.items)
+            subpackDao.deleteForCollection(collectionId)
+            subpackDao.insertAll(snapshot.subpacks)
+        } else {
+            collectionDao.deleteById(collectionId)
+            storage.deleteCollectionFiles(collectionId)
+        }
+    }
+
     suspend fun deleteCollection(collectionId: String) = withContext(Dispatchers.IO) {
+        editSnapshots.remove(collectionId)
+        activeEditIds.remove(collectionId)
         collectionDao.deleteById(collectionId)
         storage.deleteCollectionFiles(collectionId)
+        // Never delete shared cache files referenced by other collections; unreferenced cache
+        // remains reusable unless the user explicitly triggers Clear Cache in Settings.
+    }
+
+    suspend fun clearProtectedCache() = withContext(Dispatchers.IO) {
+        val protectedPaths = itemDao.getAllReferencedWebpPaths().toMutableSet()
+        storage.clearAppCache(protectedPaths)
+
+        // Prune emote_cache rows whose files are completely gone from disk
+        val deadKeys = emoteCacheDao.getAllCacheEntries().filter { entry ->
+            val hasOrig = !entry.originalFilePath.isNullOrBlank() && File(entry.originalFilePath).exists()
+            val hasStatic = !entry.staticWebpPath.isNullOrBlank() && File(entry.staticWebpPath).exists()
+            val hasAnim = !entry.animatedWebpPath.isNullOrBlank() && File(entry.animatedWebpPath).exists()
+            val hasFake = !entry.fakeVidWebpPath.isNullOrBlank() && File(entry.fakeVidWebpPath).exists()
+            !hasOrig && !hasStatic && !hasAnim && !hasFake
+        }.map { it.cacheKey }
+        if (deadKeys.isNotEmpty()) {
+            emoteCacheDao.deleteByKeys(deadKeys)
+        }
     }
 
     suspend fun exportBackupToUri(uri: Uri): Int = withContext(Dispatchers.IO) {

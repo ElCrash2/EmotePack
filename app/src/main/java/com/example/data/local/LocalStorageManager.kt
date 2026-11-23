@@ -25,6 +25,15 @@ class LocalStorageManager(private val context: Context) {
     private val collectionsRoot: File
         get() = File(context.filesDir, "collections").apply { mkdirs() }
 
+    private val sharedCacheRoot: File
+        get() = File(context.filesDir, "emote_cache").apply { mkdirs() }
+
+    private val sharedOriginalsDir: File
+        get() = File(sharedCacheRoot, "originals").apply { mkdirs() }
+
+    private val sharedVariantsDir: File
+        get() = File(sharedCacheRoot, "variants").apply { mkdirs() }
+
     fun collectionDir(collectionId: String): File =
         File(collectionsRoot, collectionId).apply { mkdirs() }
 
@@ -37,8 +46,23 @@ class LocalStorageManager(private val context: Context) {
     fun getStickerFile(collectionId: String, fileName: String): File =
         File(stickersDir(collectionId), fileName)
 
-    fun getTrayFile(collectionId: String, subpackId: String): File =
-        File(traysDir(collectionId), "tray_$subpackId.png")
+    fun getTrayFile(collectionId: String, packId: String): File =
+        File(traysDir(collectionId), "tray_$packId.png")
+
+    fun getSharedOriginalFile(emoteId: String, versionKey: String, ext: String): File {
+        val safeKey = sanitizeKey(versionKey)
+        val safeExt = ext.lowercase().filter { it.isLetterOrDigit() }.ifBlank { "bin" }
+        return File(sharedOriginalsDir, "${emoteId}_${safeKey}.$safeExt")
+    }
+
+    fun getSharedVariantFile(emoteId: String, versionKey: String, mode: String): File {
+        val safeKey = sanitizeKey(versionKey)
+        val safeMode = mode.lowercase()
+        return File(sharedVariantsDir, "${emoteId}_${safeKey}_${safeMode}.webp")
+    }
+
+    private fun sanitizeKey(raw: String): String =
+        raw.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(64)
 
     fun deleteCollectionFiles(collectionId: String) {
         File(collectionsRoot, collectionId).deleteRecursively()
@@ -52,6 +76,23 @@ class LocalStorageManager(private val context: Context) {
         }
         traysDir(collectionId).listFiles()?.forEach { file ->
             if (file.absolutePath !in activeTrayPaths) {
+                file.delete()
+            }
+        }
+    }
+
+    /**
+     * Deletes unreferenced files inside the shared emote_cache while strictly preserving
+     * any files referenced by existing saved collections.
+     */
+    fun cleanupUnreferencedSharedFiles(referencedPaths: Set<String>) {
+        sharedOriginalsDir.listFiles()?.forEach { file ->
+            if (file.absolutePath !in referencedPaths) {
+                file.delete()
+            }
+        }
+        sharedVariantsDir.listFiles()?.forEach { file ->
+            if (file.absolutePath !in referencedPaths) {
                 file.delete()
             }
         }
@@ -75,14 +116,25 @@ class LocalStorageManager(private val context: Context) {
         maxOf(10L, (itemCount * 650L) / 1024L + 10L)
 
     suspend fun calculateStorageStats(): StorageStats = withContext(Dispatchers.IO) {
-        val collectionsSize = folderSize(collectionsRoot)
-        val cacheSize = folderSize(context.cacheDir)
+        val collectionsSize = folderSize(collectionsRoot) + folderSize(sharedVariantsDir)
+        val cacheSize = folderSize(context.cacheDir) + folderSize(sharedOriginalsDir)
         val freeBytes = getFreeSpaceBytes()
         StorageStats(collectionsSize, cacheSize, freeBytes)
     }
 
-    suspend fun clearAppCache() = withContext(Dispatchers.IO) {
+    suspend fun clearAppCache(protectedPaths: Set<String> = emptySet()) = withContext(Dispatchers.IO) {
         context.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
+        // Only remove shared cache files that are NOT referenced by any saved collection
+        sharedVariantsDir.listFiles()?.forEach { file ->
+            if (file.absolutePath !in protectedPaths) {
+                file.delete()
+            }
+        }
+        sharedOriginalsDir.listFiles()?.forEach { file ->
+            if (file.absolutePath !in protectedPaths) {
+                file.delete()
+            }
+        }
     }
 
     suspend fun exportBackup(uri: Uri, collections: List<CollectionWithDetails>): Int = withContext(Dispatchers.IO) {
@@ -109,6 +161,7 @@ class LocalStorageManager(private val context: Context) {
                         put("animatedCount", c.animatedCount)
                         put("staticCount", c.staticCount)
                         put("status", c.status)
+                        put("isAnimatedPack", c.isAnimatedPack)
                     }
 
                     val itemsJson = JSONArray()
@@ -118,7 +171,7 @@ class LocalStorageManager(private val context: Context) {
                         if (!filePath.isNullOrBlank()) {
                             val f = File(filePath)
                             if (f.exists()) {
-                                relStickerPath = "files/${c.id}/stickers/${f.name}"
+                                relStickerPath = "files/${c.id}/stickers/${item.stickerFileName ?: f.name}"
                                 writeFileToZip(zip, relStickerPath, f)
                             }
                         }
@@ -143,6 +196,9 @@ class LocalStorageManager(private val context: Context) {
                             put("status", item.status)
                             put("subpackId", item.subpackId)
                             put("sortOrder", item.sortOrder)
+                            put("versionUpdatedAt", item.versionUpdatedAt)
+                            put("versionKey", item.versionKey)
+                            put("conversionMode", item.conversionMode)
                         })
                     }
                     cObj.put("items", itemsJson)
@@ -169,7 +225,7 @@ class LocalStorageManager(private val context: Context) {
                     collectionsJson.put(cObj)
                 }
 
-                manifest.put("version", 1)
+                manifest.put("version", 2)
                 manifest.put("exportedAt", System.currentTimeMillis())
                 manifest.put("collections", collectionsJson)
 
@@ -253,7 +309,10 @@ class LocalStorageManager(private val context: Context) {
                             status = itObj.optString("status", ItemConversionStatus.COMPLETED),
                             errorMessage = null,
                             subpackId = itObj.optString("subpackId").ifBlank { null },
-                            sortOrder = itObj.optInt("sortOrder", j)
+                            sortOrder = itObj.optInt("sortOrder", j),
+                            versionUpdatedAt = itObj.optLong("versionUpdatedAt", 0L),
+                            versionKey = itObj.optString("versionKey", ""),
+                            conversionMode = itObj.optString("conversionMode", ConversionModeType.STATIC)
                         )
                     )
                 }
@@ -306,7 +365,8 @@ class LocalStorageManager(private val context: Context) {
                     totalCount = cObj.optInt("totalCount", items.size),
                     animatedCount = cObj.optInt("animatedCount", items.count { it.isAnimated }),
                     staticCount = cObj.optInt("staticCount", items.count { !it.isAnimated }),
-                    status = cObj.optString("status", CollectionStatus.READY)
+                    status = cObj.optString("status", CollectionStatus.READY),
+                    isAnimatedPack = cObj.optBoolean("isAnimatedPack", subpacks.firstOrNull()?.isAnimated == true)
                 )
 
                 imported.add(CollectionWithDetails(entity, items, subpacks))

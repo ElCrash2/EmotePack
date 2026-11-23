@@ -127,6 +127,21 @@ class CreateCollectionViewModel(application: Application) : AndroidViewModel(app
         workManager.cancelUniqueWork(workName(id))
     }
 
+    fun discardOrRevertBuild(onDone: () -> Unit) {
+        val id = _activeCollectionId.value
+        if (id == null) {
+            session.clearSelection()
+            onDone()
+            return
+        }
+        workManager.cancelUniqueWork(workName(id))
+        viewModelScope.launch {
+            repo.discardCreationOrRevertEdit(id)
+            session.clearSelection()
+            onDone()
+        }
+    }
+
     private fun enqueueWorker(collectionId: String, trimAll: Boolean, trimItemIds: List<String>) {
         val input = Data.Builder()
             .putString(PackBuildWorker.KEY_COLLECTION_ID, collectionId)

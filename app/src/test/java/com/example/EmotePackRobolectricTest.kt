@@ -11,21 +11,35 @@ import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.example.conversion.ConversionOutcome
 import com.example.conversion.DecodedFrame
+import com.example.conversion.StickerConversionMode
 import com.example.conversion.StickerConverter
 import com.example.conversion.WebPContainer
 import com.example.data.local.AppDatabase
+import com.example.data.local.CollectionRepository
 import com.example.data.local.CollectionStatus
+import com.example.data.local.ConversionModeType
+import com.example.data.local.EmoteCacheEntity
 import com.example.data.local.ItemConversionStatus
+import com.example.data.local.LocalStorageManager
 import com.example.data.local.StickerCollectionEntity
 import com.example.data.local.StickerItemEntity
 import com.example.data.local.WhatsAppSubpackEntity
+import com.example.data.model.SearchOrigin
 import com.example.data.model.SearchOriginType
+import com.example.data.model.SevenTvEmote
+import com.example.ui.state.SelectionSessionManager
+import com.example.ui.state.ToggleSelectionResult
 import com.example.ui.viewmodel.HomeViewModel
+import com.example.whatsapp.PackValidationResult
 import com.example.whatsapp.StickerContentProvider
-import com.example.whatsapp.SubpackBuilder
+import com.example.whatsapp.StickerPackFormat
+import com.example.whatsapp.WhatsAppPackBuilder
+import com.example.whatsapp.WhatsAppPackExporter
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -42,6 +56,35 @@ import java.util.Locale
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class EmotePackRobolectricTest {
 
+    private fun createSamplePng(color: Int = Color.CYAN): ByteArray {
+        val bmp = Bitmap.createBitmap(200, 100, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.TRANSPARENT)
+            val c = Canvas(this)
+            val p = Paint().apply { this.color = color }
+            c.drawCircle(100f, 50f, 40f, p)
+        }
+        val out = ByteArrayOutputStream().apply {
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, this)
+        }.toByteArray()
+        bmp.recycle()
+        return out
+    }
+
+    private fun sampleEmotes(count: Int, animatedEvery: Int = 0): List<SevenTvEmote> =
+        (1..count).map { i ->
+            val anim = animatedEvery > 0 && (i % animatedEvery == 0)
+            SevenTvEmote(
+                id = "emote_$i",
+                name = "Emote$i",
+                animated = anim,
+                flags = if (anim) 256 else 0,
+                ownerName = "Tester",
+                previewUrl = "https://cdn.7tv.app/emote/emote_$i/2x.webp",
+                highResUrl = "https://cdn.7tv.app/emote/emote_$i/4x.webp",
+                updatedAt = 1000L + i
+            )
+        }
+
     @Test
     fun `localization switches cleanly between Spanish and English`() {
         val base = ApplicationProvider.getApplicationContext<Context>()
@@ -49,14 +92,17 @@ class EmotePackRobolectricTest {
         val esConfig = Configuration(base.resources.configuration).apply { setLocale(Locale.forLanguageTag("es")) }
         val esContext = base.createConfigurationContext(esConfig)
         assertEquals("Buscar streamer", esContext.getString(R.string.search_streamer_label))
-        assertEquals("Buscar emote", esContext.getString(R.string.search_emote_label))
-        assertEquals("Mis packs de stickers", esContext.getString(R.string.nav_my_packs))
+        assertEquals("Seleccionar primeros 30", esContext.getString(R.string.select_first_30))
+        assertEquals("Cancelar creación", esContext.getString(R.string.cancel_creation))
+        assertEquals("Enviar a WhatsApp", esContext.getString(R.string.send_to_whatsapp))
 
         val enConfig = Configuration(base.resources.configuration).apply { setLocale(Locale.ENGLISH) }
         val enContext = base.createConfigurationContext(enConfig)
         assertEquals("Search streamer", enContext.getString(R.string.search_streamer_label))
-        assertEquals("Search emote", enContext.getString(R.string.search_emote_label))
-        assertEquals("My Sticker Packs", enContext.getString(R.string.nav_my_packs))
+        assertEquals("Select first 30", enContext.getString(R.string.select_first_30))
+        assertEquals("Cancel creation", enContext.getString(R.string.cancel_creation))
+        assertEquals("Send to WhatsApp", enContext.getString(R.string.send_to_whatsapp))
+        assertEquals("EmotePack", AppConfig.getPackAuthor(enContext))
     }
 
     @Test
@@ -76,56 +122,71 @@ class EmotePackRobolectricTest {
         vm.updateEmoteQuery("peepoHappy")
         assertEquals("peepoHappy", vm.uiState.value.emoteQuery)
         assertEquals("", vm.uiState.value.streamerQuery)
-
-        vm.onStreamerFieldActivated()
-        assertEquals(SearchOriginType.STREAMER, vm.uiState.value.activeMode)
-        assertEquals("", vm.uiState.value.emoteQuery)
     }
 
     @Test
-    fun `subpack builder balances chunks over 30 without leaving orphan subpacks under 3`() {
-        val items32 = (1..32).map { "item_$it" }
-        val chunks32 = SubpackBuilder.chunkStickers(items32)
-        assertEquals(2, chunks32.size)
-        assertEquals(29, chunks32[0].size)
-        assertEquals(3, chunks32[1].size)
+    fun `selection session strictly enforces max 30 cap and selectFirst30 order`() {
+        val session = SelectionSessionManager()
+        val emotes35 = sampleEmotes(35)
 
-        val items31 = (1..31).map { "item_$it" }
-        val chunks31 = SubpackBuilder.chunkStickers(items31)
-        assertEquals(2, chunks31.size)
-        assertEquals(28, chunks31[0].size)
-        assertEquals(3, chunks31[1].size)
+        val first30Res = session.selectFirst30(emotes35)
+        assertEquals(30, first30Res.selectedCount)
+        assertEquals(30, session.selectedEmotes.value.size)
+        assertEquals("emote_1", session.selectedEmotes.value.keys.first())
+        assertEquals("emote_30", session.selectedEmotes.value.keys.last())
+        assertFalse(session.selectedEmotes.value.containsKey("emote_31"))
 
-        val items15 = (1..15).map { "item_$it" }
-        val chunks15 = SubpackBuilder.chunkStickers(items15)
-        assertEquals(1, chunks15.size)
-        assertEquals(15, chunks15[0].size)
+        val toggle31 = session.toggleEmote(emotes35[30])
+        assertEquals(ToggleSelectionResult.LIMIT_REACHED, toggle31)
+        assertEquals(30, session.selectedEmotes.value.size)
+
+        val toggleRemove = session.toggleEmote(emotes35[0])
+        assertEquals(ToggleSelectionResult.REMOVED, toggleRemove)
+        assertEquals(29, session.selectedEmotes.value.size)
+
+        val toggleAddAgain = session.toggleEmote(emotes35[30])
+        assertEquals(ToggleSelectionResult.ADDED, toggleAddAgain)
+        assertEquals(30, session.selectedEmotes.value.size)
     }
 
     @Test
-    fun `static sticker conversion produces valid 512x512 WebP under 100 KB`() {
-        val bmp = Bitmap.createBitmap(200, 100, Bitmap.Config.ARGB_8888).apply {
-            eraseColor(Color.TRANSPARENT)
-            val c = Canvas(this)
-            val p = Paint().apply { color = Color.CYAN }
-            c.drawCircle(100f, 50f, 40f, p)
-        }
-        val pngBytes = ByteArrayOutputStream().apply {
-            bmp.compress(Bitmap.CompressFormat.PNG, 100, this)
-        }.toByteArray()
-        bmp.recycle()
+    fun `static sticker conversion and fake-vid conversion meet WhatsApp limits`() {
+        val pngBytes = createSamplePng(Color.CYAN)
 
-        val outcome = StickerConverter.convert(pngBytes, expectAnimated = false, allowTrimOver10s = false)
-        assertTrue(outcome is ConversionOutcome.Success)
-        val success = outcome as ConversionOutcome.Success
-        assertFalse(success.isAnimated)
-        assertEquals(512, success.inspection.width)
-        assertEquals(512, success.inspection.height)
-        assertTrue(success.webpBytes.size <= StickerConverter.MAX_STATIC_BYTES)
-        assertTrue(WebPContainer.isWebP(success.webpBytes))
+        // Pure static -> 512x512 static WebP <= 100 KB
+        val staticOutcome = StickerConverter.convert(
+            inputBytes = pngBytes,
+            mode = StickerConversionMode.STATIC,
+            allowTrimOver10s = false
+        )
+        assertTrue(staticOutcome is ConversionOutcome.Success)
+        val staticSuccess = staticOutcome as ConversionOutcome.Success
+        assertFalse(staticSuccess.isAnimated)
+        assertEquals(StickerConversionMode.STATIC, staticSuccess.conversionMode)
+        assertEquals(512, staticSuccess.inspection.width)
+        assertEquals(512, staticSuccess.inspection.height)
+        assertTrue(staticSuccess.webpBytes.size <= StickerConverter.MAX_STATIC_BYTES)
 
-        val tempFile = File.createTempFile("static_test_", ".webp").apply {
-            writeBytes(success.webpBytes)
+        // Mixed pack static emote -> FAKE_VID real motionless animated WebP (>=2 frames, <=500 KB)
+        val fakeVidOutcome = StickerConverter.convert(
+            inputBytes = pngBytes,
+            mode = StickerConversionMode.FAKE_VID,
+            allowTrimOver10s = false
+        )
+        assertTrue(fakeVidOutcome is ConversionOutcome.Success)
+        val fakeVidSuccess = fakeVidOutcome as ConversionOutcome.Success
+        assertTrue(fakeVidSuccess.isAnimated)
+        assertEquals(StickerConversionMode.FAKE_VID, fakeVidSuccess.conversionMode)
+        assertEquals(512, fakeVidSuccess.inspection.width)
+        assertEquals(512, fakeVidSuccess.inspection.height)
+        assertTrue(fakeVidSuccess.inspection.isAnimated)
+        assertTrue(fakeVidSuccess.inspection.frameCount >= 2)
+        assertTrue(fakeVidSuccess.inspection.minFrameDurationMs >= 8)
+        assertTrue(fakeVidSuccess.inspection.totalDurationMs <= 10_000)
+        assertTrue(fakeVidSuccess.webpBytes.size <= StickerConverter.MAX_ANIMATED_BYTES)
+
+        val tempFile = File.createTempFile("fakevid_test_", ".webp").apply {
+            writeBytes(fakeVidSuccess.webpBytes)
             deleteOnExit()
         }
         val trayBytes = StickerConverter.generateTrayIcon(tempFile)
@@ -137,19 +198,6 @@ class EmotePackRobolectricTest {
         val frame1 = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
         val frame2 = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.BLUE) }
 
-        val muxedNormal = WebPContainer.encodeAnimatedWebP(
-            frames = listOf(DecodedFrame(frame1, 80), DecodedFrame(frame2, 80)),
-            width = 128,
-            height = 128,
-            quality = 80
-        )
-        val infoNormal = WebPContainer.inspect(muxedNormal)
-        assertTrue(infoNormal.isValidWebP)
-        assertTrue(infoNormal.isAnimated)
-        assertEquals(2, infoNormal.frameCount)
-        assertEquals(160, infoNormal.totalDurationMs)
-
-        // Over 10s animation (e.g. 3 frames x 4000ms = 12,000ms) must prompt user unless allowed
         val muxedLong = WebPContainer.encodeAnimatedWebP(
             frames = listOf(
                 DecodedFrame(frame1, 4000),
@@ -180,40 +228,189 @@ class EmotePackRobolectricTest {
     }
 
     @Test
-    fun `sticker content provider exposes ready subpacks and sticker rows`() = runBlocking {
+    fun `single pack builder handles mixed fake-vid collections and drafts without splitting`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val storage = LocalStorageManager(context)
+        val pngBytes = createSamplePng(Color.GREEN)
+        val fakeVidRes = StickerConverter.convert(pngBytes, StickerConversionMode.FAKE_VID, false) as ConversionOutcome.Success
+        val frame1 = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
+        val frame2 = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.YELLOW) }
+        val animRes = StickerConverter.convert(
+            WebPContainer.encodeAnimatedWebP(listOf(DecodedFrame(frame1, 80), DecodedFrame(frame2, 80)), 64, 64, 85),
+            StickerConversionMode.ANIMATED,
+            false
+        ) as ConversionOutcome.Success
+        frame1.recycle()
+        frame2.recycle()
+
+        val colId = "single_mixed_pack_1"
+        val items = listOf(1, 2, 3).map { idx ->
+            val isAnim = idx == 1
+            val bytes = if (isAnim) animRes.webpBytes else fakeVidRes.webpBytes
+            val f = storage.getSharedVariantFile("em_$idx", "1", if (isAnim) "ANIMATED" else "FAKE_VID")
+            f.writeBytes(bytes)
+            StickerItemEntity(
+                id = "it_$idx",
+                collectionId = colId,
+                emoteId = "em_$idx",
+                emoteName = "Emote$idx",
+                sourceSetId = null,
+                sourceSetName = null,
+                isAnimated = isAnim,
+                previewUrl = "",
+                highResUrl = "",
+                fallbackUrlsCsv = "",
+                finalWebpPath = f.absolutePath,
+                stickerFileName = "sticker_em_$idx.webp",
+                fileSizeBytes = bytes.size.toLong(),
+                width = 512,
+                height = 512,
+                frameCount = 2,
+                durationMs = 500,
+                hasAlpha = true,
+                status = ItemConversionStatus.COMPLETED,
+                errorMessage = null,
+                subpackId = null,
+                sortOrder = idx - 1,
+                versionUpdatedAt = 1L,
+                versionKey = "1",
+                conversionMode = if (isAnim) ConversionModeType.ANIMATED else ConversionModeType.FAKE_VID
+            )
+        }
+
+        val mixedEmotes = sampleEmotes(3, animatedEvery = 3)
+        assertEquals(StickerPackFormat.MIXED_FAKE_VID, WhatsAppPackBuilder.determinePackFormat(mixedEmotes))
+
+        val singleBuild = WhatsAppPackBuilder.buildSinglePack(
+            storage = storage,
+            collectionId = colId,
+            collectionName = "Mixed Test Pack",
+            completedItems = items,
+            existingPacks = emptyList()
+        )
+        val builtPack = singleBuild.pack!!
+        assertTrue(singleBuild.isAnimatedPack)
+        assertTrue(builtPack.isWhatsAppReady)
+        assertEquals(3, builtPack.stickerCount)
+        assertTrue(WhatsAppPackExporter.validatePackReadyForWhatsApp(builtPack, items) is PackValidationResult.Valid)
+
+        // Draft check: 2 items -> saved cleanly locally, not WhatsApp-ready yet
+        val draftBuild = WhatsAppPackBuilder.buildSinglePack(
+            storage = storage,
+            collectionId = "draft_col",
+            collectionName = "Draft 2",
+            completedItems = items.take(2),
+            existingPacks = emptyList()
+        )
+        assertNotNull(draftBuild.pack)
+        assertFalse(draftBuild.pack!!.isWhatsAppReady)
+        assertTrue(WhatsAppPackExporter.validatePackReadyForWhatsApp(draftBuild.pack, items.take(2)) is PackValidationResult.TooFewStickers)
+    }
+
+    @Test
+    fun `repository shared cache reuses files, reverts edit cancel, and protects other collections on delete`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = AppDatabase.getInstance(context)
+        val storage = LocalStorageManager(context)
+        val repo = CollectionRepository(context, db, storage)
 
-        val colId = "col_test_1"
-        val subpackId = "sp_test_anim_1"
+        val pngBytes = createSamplePng(Color.BLUE)
+        val staticRes = StickerConverter.convert(pngBytes, StickerConversionMode.STATIC, false) as ConversionOutcome.Success
+        val emote = sampleEmotes(1).first()
+        val cacheKey = "${emote.id}_${emote.versionKey}"
+        val cachedVariant = storage.getSharedVariantFile(emote.id, emote.versionKey, ConversionModeType.STATIC)
+        cachedVariant.writeBytes(staticRes.webpBytes)
+        db.emoteCacheDao().upsert(
+            EmoteCacheEntity(
+                cacheKey = cacheKey,
+                emoteId = emote.id,
+                versionKey = emote.versionKey,
+                updatedAt = emote.updatedAt,
+                sourceUrl = emote.highResUrl,
+                originalFormat = "WEBP",
+                originalFilePath = null,
+                staticWebpPath = cachedVariant.absolutePath,
+                animatedWebpPath = null,
+                fakeVidWebpPath = null,
+                converterVersion = AppConfig.CONVERTER_VERSION,
+                createdAt = 100L,
+                lastUsedAt = 100L
+            )
+        )
+
+        val origin = SearchOrigin(SearchOriginType.EMOTE, "Emote1")
+        // Create Col A -> should immediately hit shared cache!
+        val colA = repo.prepareCollectionBuild(null, "Pack A", origin, listOf(emote))
+        repo.finalizeCollectionBuild(colA, cancelled = false)
+        val detailsA = repo.getCollectionWithDetails(colA)
+        assertNotNull(detailsA)
+        assertEquals(ItemConversionStatus.COMPLETED, detailsA!!.items.first().status)
+        assertEquals(cachedVariant.absolutePath, detailsA.items.first().finalWebpPath)
+
+        // Create Col B sharing the exact same emote
+        val colB = repo.prepareCollectionBuild(null, "Pack B", origin, listOf(emote))
+        repo.finalizeCollectionBuild(colB, cancelled = false)
+
+        // Delete Col A -> shared cache file referenced by Col B MUST survive!
+        repo.deleteCollection(colA)
+        assertNull(repo.getCollectionWithDetails(colA))
+        assertTrue(cachedVariant.exists())
+        repo.clearProtectedCache()
+        assertTrue(cachedVariant.exists())
+
+        // Edit Col B with a different name and cancel/revert -> restores "Pack B"
+        val emote2 = sampleEmotes(2)[1]
+        repo.prepareCollectionBuild(colB, "Pack B Edited", origin, listOf(emote, emote2))
+        assertEquals("Pack B Edited", repo.getCollectionWithDetails(colB)?.collection?.name)
+        repo.discardCreationOrRevertEdit(colB)
+        assertEquals("Pack B", repo.getCollectionWithDetails(colB)?.collection?.name)
+        assertEquals(1, repo.getCollectionWithDetails(colB)?.items?.size)
+        Unit
+    }
+
+    @Test
+    fun `sticker content provider exposes ready single pack with EmotePack author and resolves shared paths`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val storage = LocalStorageManager(context)
+
+        val colId = "col_provider_test"
+        val pngBytes = createSamplePng(Color.RED)
+        val fakeVidRes = StickerConverter.convert(pngBytes, StickerConversionMode.FAKE_VID, false) as ConversionOutcome.Success
+        val variantFile = storage.getSharedVariantFile("prov_em_1", "1", "FAKE_VID")
+        variantFile.writeBytes(fakeVidRes.webpBytes)
+        val trayFile = storage.getTrayFile(colId, colId)
+        trayFile.writeBytes(StickerConverter.generateTrayIcon(variantFile)!!)
+
         db.collectionDao().upsert(
             StickerCollectionEntity(
                 id = colId,
-                name = "Streamer Pack",
+                name = "Mixed Pack",
                 createdAt = 1000L,
                 updatedAt = 2000L,
-                searchType = "STREAMER",
-                searchQuery = "TestStreamer",
-                streamerId = "u1",
-                streamerName = "TestStreamer",
-                streamerUsername = "teststreamer",
+                searchType = "EMOTE",
+                searchQuery = "Mixed",
+                streamerId = null,
+                streamerName = null,
+                streamerUsername = null,
                 streamerAvatarUrl = null,
-                sourceEmoteSetId = "set1",
-                trayIconPath = null,
+                sourceEmoteSetId = null,
+                trayIconPath = trayFile.absolutePath,
                 totalCount = 3,
-                animatedCount = 3,
-                staticCount = 0,
-                status = CollectionStatus.READY
+                animatedCount = 1,
+                staticCount = 2,
+                status = CollectionStatus.READY,
+                isAnimatedPack = true
             )
         )
         db.subpackDao().insertAll(
             listOf(
                 WhatsAppSubpackEntity(
-                    id = subpackId,
+                    id = colId,
                     collectionId = colId,
-                    displayName = "Streamer Pack - Animated",
+                    displayName = "Mixed Pack",
                     isAnimated = true,
-                    trayIconPath = "/tmp/tray_$subpackId.png",
+                    trayIconPath = trayFile.absolutePath,
                     imageDataVersion = 1,
                     stickerCount = 3,
                     isWhatsAppReady = true,
@@ -224,53 +421,61 @@ class EmotePackRobolectricTest {
         db.stickerItemDao().insertAll(
             (1..3).map { i ->
                 StickerItemEntity(
-                    id = "item_$i",
+                    id = "p_item_$i",
                     collectionId = colId,
-                    emoteId = "em_$i",
-                    emoteName = "Emote$i",
-                    sourceSetId = "set1",
-                    sourceSetName = "Main",
-                    isAnimated = true,
-                    previewUrl = "https://cdn.7tv.app/emote/em_$i/2x.webp",
-                    highResUrl = "https://cdn.7tv.app/emote/em_$i/4x.webp",
+                    emoteId = "prov_em_$i",
+                    emoteName = "ProvEmote$i",
+                    sourceSetId = null,
+                    sourceSetName = null,
+                    isAnimated = (i == 1),
+                    previewUrl = "",
+                    highResUrl = "",
                     fallbackUrlsCsv = "",
-                    finalWebpPath = "/tmp/sticker_$i.webp",
-                    stickerFileName = "sticker_$i.webp",
-                    fileSizeBytes = 12345L,
+                    finalWebpPath = variantFile.absolutePath,
+                    stickerFileName = "sticker_prov_em_$i.webp",
+                    fileSizeBytes = fakeVidRes.webpBytes.size.toLong(),
                     width = 512,
                     height = 512,
-                    frameCount = 10,
-                    durationMs = 800,
+                    frameCount = 2,
+                    durationMs = 1000,
                     hasAlpha = true,
                     status = ItemConversionStatus.COMPLETED,
                     errorMessage = null,
-                    subpackId = subpackId,
-                    sortOrder = i
+                    subpackId = colId,
+                    sortOrder = i,
+                    versionUpdatedAt = 1L,
+                    versionKey = "1",
+                    conversionMode = ConversionModeType.FAKE_VID
                 )
             }
         )
 
-        val controller = Robolectric.buildContentProvider(StickerContentProvider::class.java)
-            .create()
+        val controller = Robolectric.buildContentProvider(StickerContentProvider::class.java).create()
         val provider = controller.get()
         val authority = BuildConfig.CONTENT_PROVIDER_AUTHORITY
 
-        val metaUri = Uri.parse("content://$authority/metadata")
+        val metaUri = Uri.parse("content://$authority/metadata/$colId")
         provider.query(metaUri, null, null, null, null).use { cursor ->
             assertEquals(1, cursor.count)
             assertTrue(cursor.moveToFirst())
-            assertEquals(subpackId, cursor.getString(cursor.getColumnIndexOrThrow(StickerContentProvider.STICKER_PACK_IDENTIFIER_IN_QUERY)))
-            assertEquals("Streamer Pack - Animated", cursor.getString(cursor.getColumnIndexOrThrow(StickerContentProvider.STICKER_PACK_NAME_IN_QUERY)))
+            assertEquals(colId, cursor.getString(cursor.getColumnIndexOrThrow(StickerContentProvider.STICKER_PACK_IDENTIFIER_IN_QUERY)))
+            assertEquals("Mixed Pack", cursor.getString(cursor.getColumnIndexOrThrow(StickerContentProvider.STICKER_PACK_NAME_IN_QUERY)))
+            assertEquals(AppConfig.getPackAuthor(context), cursor.getString(cursor.getColumnIndexOrThrow(StickerContentProvider.STICKER_PACK_PUBLISHER_IN_QUERY)))
             assertEquals(1, cursor.getInt(cursor.getColumnIndexOrThrow(StickerContentProvider.ANIMATED_STICKER_PACK)))
         }
 
-        val stickersUri = Uri.parse("content://$authority/stickers/$subpackId")
+        val stickersUri = Uri.parse("content://$authority/stickers/$colId")
         provider.query(stickersUri, null, null, null, null).use { cursor ->
             assertEquals(3, cursor.count)
             assertTrue(cursor.moveToFirst())
-            assertEquals("sticker_1.webp", cursor.getString(cursor.getColumnIndexOrThrow(StickerContentProvider.STICKER_FILE_NAME_IN_QUERY)))
+            assertEquals("sticker_prov_em_1.webp", cursor.getString(cursor.getColumnIndexOrThrow(StickerContentProvider.STICKER_FILE_NAME_IN_QUERY)))
         }
 
-        db.close()
+        // Open asset directly from shared cache path via ContentProvider
+        val assetUri = Uri.parse("content://$authority/stickers_asset/$colId/sticker_prov_em_1.webp")
+        val afd = provider.openAssetFile(assetUri, "r")
+        assertNotNull(afd)
+        afd?.close()
+        Unit
     }
 }

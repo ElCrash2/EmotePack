@@ -48,7 +48,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun clearCache(onDone: () -> Unit) {
         viewModelScope.launch {
             sevenTvRepo.clearMemoryCache()
-            storage.clearAppCache()
+            collectionRepo.clearProtectedCache()
             refreshStorageStats()
             onDone()
         }

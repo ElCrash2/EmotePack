@@ -64,7 +64,8 @@ class EmoteGridAdapter(
                 binding.tvEmoteTypeBadge.setTextColor(ContextCompat.getColor(ctx, R.color.badge_static_fg))
             }
 
-            binding.ivEmote.load(emote.previewUrl) {
+            val localFile = emote.localPreviewPath?.let { java.io.File(it) }?.takeIf { it.exists() }
+            binding.ivEmote.load(localFile ?: emote.previewUrl) {
                 placeholder(R.drawable.ic_emoji)
                 error(R.drawable.ic_emoji)
             }

@@ -45,6 +45,25 @@ class CollectionDetailViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
+    fun hasPendingEditSnapshot(): Boolean {
+        val id = collectionIdFlow.value ?: return false
+        return repo.hasPendingEditSnapshot(id)
+    }
+
+    fun commitCreationSummary() {
+        val id = collectionIdFlow.value ?: return
+        repo.commitCreationSummary(id)
+    }
+
+    fun cancelCreationOrRevertEdit(onDone: () -> Unit) {
+        val id = collectionIdFlow.value ?: return
+        viewModelScope.launch {
+            repo.discardCreationOrRevertEdit(id)
+            session.clearSelection()
+            onDone()
+        }
+    }
+
     fun deleteCollection(onDeleted: () -> Unit) {
         val id = collectionIdFlow.value ?: return
         viewModelScope.launch {

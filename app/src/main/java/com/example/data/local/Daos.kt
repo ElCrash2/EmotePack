@@ -1,11 +1,10 @@
 package com.example.data.local
 
 import androidx.room.Dao
-import androidx.room.Insert
-import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Update
+import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -28,7 +27,7 @@ interface CollectionDao {
     @Query("SELECT * FROM sticker_collections ORDER BY createdAt ASC")
     suspend fun getAllCollectionsWithDetails(): List<CollectionWithDetails>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsert(collection: StickerCollectionEntity)
 
     @Query("DELETE FROM sticker_collections WHERE id = :collectionId")
@@ -43,10 +42,19 @@ interface StickerItemDao {
     @Query("SELECT * FROM sticker_items WHERE collectionId = :collectionId ORDER BY sortOrder ASC")
     suspend fun getItemsForCollection(collectionId: String): List<StickerItemEntity>
 
-    @Query("SELECT * FROM sticker_items WHERE subpackId = :subpackId AND status = 'COMPLETED' ORDER BY sortOrder ASC")
+    @Query("SELECT * FROM sticker_items WHERE subpackId = :subpackId AND status = 'COMPLETED' ORDER BY sortOrder ASC LIMIT 30")
     suspend fun getCompletedItemsForSubpack(subpackId: String): List<StickerItemEntity>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Query("SELECT * FROM sticker_items WHERE collectionId = :collectionId AND stickerFileName = :fileName LIMIT 1")
+    suspend fun getItemByCollectionAndFileName(collectionId: String, fileName: String): StickerItemEntity?
+
+    @Query("SELECT finalWebpPath FROM sticker_items WHERE finalWebpPath IS NOT NULL")
+    suspend fun getAllReferencedWebpPaths(): List<String>
+
+    @Query("SELECT DISTINCT emoteId FROM sticker_items")
+    suspend fun getAllReferencedEmoteIds(): List<String>
+
+    @Upsert
     suspend fun insertAll(items: List<StickerItemEntity>)
 
     @Update
@@ -70,7 +78,7 @@ interface SubpackDao {
     @Query("SELECT * FROM whatsapp_subpacks WHERE id = :subpackId")
     suspend fun getSubpackById(subpackId: String): WhatsAppSubpackEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun insertAll(subpacks: List<WhatsAppSubpackEntity>)
 
     @Query("UPDATE whatsapp_subpacks SET addedToWhatsApp = :added WHERE id = :subpackId")
@@ -78,4 +86,25 @@ interface SubpackDao {
 
     @Query("DELETE FROM whatsapp_subpacks WHERE collectionId = :collectionId")
     suspend fun deleteForCollection(collectionId: String)
+}
+
+@Dao
+interface EmoteCacheDao {
+    @Query("SELECT * FROM emote_cache WHERE cacheKey = :cacheKey LIMIT 1")
+    suspend fun getByCacheKey(cacheKey: String): EmoteCacheEntity?
+
+    @Query("SELECT * FROM emote_cache WHERE emoteId = :emoteId ORDER BY updatedAt DESC LIMIT 1")
+    suspend fun getLatestForEmote(emoteId: String): EmoteCacheEntity?
+
+    @Query("SELECT * FROM emote_cache")
+    suspend fun getAllCacheEntries(): List<EmoteCacheEntity>
+
+    @Upsert
+    suspend fun upsert(entry: EmoteCacheEntity)
+
+    @Query("UPDATE emote_cache SET lastUsedAt = :timestamp WHERE cacheKey = :cacheKey")
+    suspend fun touch(cacheKey: String, timestamp: Long)
+
+    @Query("DELETE FROM emote_cache WHERE cacheKey IN (:keys)")
+    suspend fun deleteByKeys(keys: List<String>)
 }

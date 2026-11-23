@@ -42,7 +42,7 @@ class SevenTvRepository(private val api: SevenTvApiService) {
     suspend fun searchStreamers(
         query: String,
         page: Int = 1,
-        limit: Int = 24
+        limit: Int = 30
     ): ApiResult<UserSearchPage> = withContext(Dispatchers.IO) {
         val trimmed = query.trim()
         val cacheKey = "$trimmed|$page|$limit"
@@ -144,8 +144,12 @@ class SevenTvRepository(private val api: SevenTvApiService) {
         }
     }
 
-    suspend fun getStreamerWithEmoteSets(userId: String): ApiResult<SevenTvUser> = withContext(Dispatchers.IO) {
-        userDetailCache.get(userId)?.let { return@withContext ApiResult.Success(it) }
+    suspend fun getStreamerWithEmoteSets(userId: String, targetSetId: String? = null): ApiResult<SevenTvUser> = withContext(Dispatchers.IO) {
+        userDetailCache.get(userId)?.let { cached ->
+            if (targetSetId == null || cached.emoteSets.firstOrNull { it.id == targetSetId }?.emotes?.isNotEmpty() == true) {
+                return@withContext ApiResult.Success(cached)
+            }
+        }
 
         try {
             val response = retryCall { api.getUserById(userId) }
@@ -163,28 +167,27 @@ class SevenTvRepository(private val api: SevenTvApiService) {
             val json = JSONObject(raw)
             var user = parseRestUser(json)
 
-            // Collect any extra emote_set_ids referenced by connections that might not be in emote_sets
+            // Register any extra emote_set_ids referenced by connections as metadata shells (fetch lazily when selected)
             val knownSetIds = user.emoteSets.map { it.id }.toMutableSet()
             val extraSetIds = user.connections.mapNotNull { it.emoteSetId }.filter { it.isNotBlank() && it !in knownSetIds }
+            if (extraSetIds.isNotEmpty()) {
+                val extraShells = extraSetIds.distinct().map { setId ->
+                    SevenTvEmoteSet(id = setId, name = "Channel Set", capacity = 0, emotes = emptyList())
+                }
+                user = user.copy(emoteSets = user.emoteSets + extraShells)
+            }
 
-            val setsNeedingFetch = user.emoteSets.filter { it.emotes.isEmpty() }.map { it.id } + extraSetIds
-            if (setsNeedingFetch.isNotEmpty()) {
-                val fetchedSets = coroutineScope {
-                    setsNeedingFetch.distinct().map { setId ->
-                        async { fetchEmoteSetInternal(setId) }
-                    }.awaitAll().filterNotNull()
+            // Fetch ONLY the active/target set if its emotes were empty (avoid downloading all sets at once!)
+            val activeSet = if (targetSetId != null) {
+                user.emoteSets.firstOrNull { it.id == targetSetId }
+            } else {
+                user.emoteSets.firstOrNull()
+            }
+            if (activeSet != null && activeSet.emotes.isEmpty()) {
+                fetchEmoteSetInternal(activeSet.id)?.let { loaded ->
+                    val updatedSets = user.emoteSets.map { if (it.id == loaded.id) loaded else it }
+                    user = user.copy(emoteSets = updatedSets)
                 }
-                val fetchedMap = fetchedSets.associateBy { it.id }
-                val mergedSets = user.emoteSets.map { existing ->
-                    val refreshed = fetchedMap[existing.id]
-                    if (refreshed != null && refreshed.emotes.isNotEmpty()) refreshed else existing
-                }.toMutableList()
-                fetchedSets.forEach { extra ->
-                    if (mergedSets.none { it.id == extra.id }) {
-                        mergedSets.add(extra)
-                    }
-                }
-                user = user.copy(emoteSets = mergedSets)
             }
 
             userDetailCache.put(userId, user)
@@ -196,10 +199,26 @@ class SevenTvRepository(private val api: SevenTvApiService) {
         }
     }
 
+    suspend fun loadEmoteSetOnDemand(userId: String, setId: String): ApiResult<SevenTvEmoteSet> = withContext(Dispatchers.IO) {
+        try {
+            val loaded = fetchEmoteSetInternal(setId)
+                ?: return@withContext ApiResult.Error("HTTP 404")
+            userDetailCache.get(userId)?.let { cached ->
+                val updatedSets = cached.emoteSets.map { if (it.id == loaded.id) loaded else it }
+                userDetailCache.put(userId, cached.copy(emoteSets = updatedSets))
+            }
+            ApiResult.Success(loaded)
+        } catch (e: IOException) {
+            ApiResult.Error(e.message ?: "Network error", isNetwork = true)
+        } catch (e: Exception) {
+            ApiResult.Error(e.message ?: "Unexpected error")
+        }
+    }
+
     suspend fun searchEmotes(
         query: String,
         page: Int = 1,
-        limit: Int = 36
+        limit: Int = 30
     ): ApiResult<EmoteSearchPage> = withContext(Dispatchers.IO) {
         val trimmed = query.trim()
         val cacheKey = "$trimmed|$page|$limit"
@@ -218,6 +237,7 @@ class SevenTvRepository(private val api: SevenTvApiService) {
                           name
                           flags
                           animated
+                          updated_at
                           owner {
                             id
                             username
@@ -421,6 +441,7 @@ class SevenTvRepository(private val api: SevenTvApiService) {
                         }
                     }
                     val (preview, highRes, fallbacks) = selectUrlsFromVariants(id, animated, variants)
+                    val bestFormat = variants.firstOrNull { it.url == highRes }?.format.orEmpty()
                     add(
                         SevenTvEmote(
                             id = id,
@@ -430,7 +451,9 @@ class SevenTvRepository(private val api: SevenTvApiService) {
                             ownerName = null,
                             previewUrl = preview,
                             highResUrl = highRes,
-                            fallbackUrls = fallbacks
+                            fallbackUrls = fallbacks,
+                            updatedAt = 0L,
+                            originalFormat = bestFormat
                         )
                     )
                 }
@@ -585,6 +608,7 @@ class SevenTvRepository(private val api: SevenTvApiService) {
         val name = overrideName ?: obj.optString("name").ifBlank { id }
         val flags = obj.optInt("flags", 0)
         val animated = obj.optBoolean("animated", false)
+        val updatedAt = obj.optLong("updated_at", 0L)
         val ownerObj = obj.optJSONObject("owner")
         val ownerName = ownerObj?.optString("display_name")?.ifBlank { ownerObj.optString("username") }
 
@@ -617,6 +641,8 @@ class SevenTvRepository(private val api: SevenTvApiService) {
         }
 
         val (preview, highRes, fallbacks) = selectUrlsFromVariants(id, animated, variants)
+        val highResFormat = variants.firstOrNull { it.url == highRes }?.format
+            ?: highRes.substringAfterLast('.', "webp").uppercase()
 
         return SevenTvEmote(
             id = id,
@@ -628,7 +654,9 @@ class SevenTvRepository(private val api: SevenTvApiService) {
             highResUrl = highRes,
             fallbackUrls = fallbacks,
             sourceSetId = sourceSetId,
-            sourceSetName = sourceSetName
+            sourceSetName = sourceSetName,
+            updatedAt = updatedAt,
+            originalFormat = highResFormat
         )
     }
 

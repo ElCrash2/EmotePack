@@ -5,7 +5,13 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import com.example.AppConfig
 import com.example.BuildConfig
+import com.example.conversion.StickerConverter
+import com.example.data.local.ItemConversionStatus
+import com.example.data.local.StickerItemEntity
+import com.example.data.local.WhatsAppSubpackEntity
+import java.io.File
 
 data class WhatsAppEnvironment(
     val consumerInstalled: Boolean,
@@ -15,6 +21,13 @@ data class WhatsAppEnvironment(
 ) {
     val anyCompatible: Boolean get() = (consumerInstalled && consumerCompatible) || (businessInstalled && businessCompatible)
     val anyInstalled: Boolean get() = consumerInstalled || businessInstalled
+}
+
+sealed class PackValidationResult {
+    object Valid : PackValidationResult()
+    data class TooFewStickers(val count: Int) : PackValidationResult()
+    data class TooManyStickers(val count: Int) : PackValidationResult()
+    data class InvalidAssets(val reason: String) : PackValidationResult()
 }
 
 object WhatsAppPackExporter {
@@ -43,6 +56,37 @@ object WhatsAppPackExporter {
             businessInstalled = businessInstalled,
             businessCompatible = businessCompat
         )
+    }
+
+    /**
+     * Validates that a pack has 3..30 stickers, a valid <=50KB tray PNG,
+     * and every sticker WebP exists and strictly matches the pack's animated/static format.
+     */
+    fun validatePackReadyForWhatsApp(
+        pack: WhatsAppSubpackEntity?,
+        items: List<StickerItemEntity>
+    ): PackValidationResult {
+        val completed = items.filter { it.status == ItemConversionStatus.COMPLETED }
+        if (completed.size < AppConfig.MIN_STICKERS_FOR_WHATSAPP) {
+            return PackValidationResult.TooFewStickers(completed.size)
+        }
+        if (completed.size > AppConfig.MAX_STICKERS_PER_COLLECTION) {
+            return PackValidationResult.TooManyStickers(completed.size)
+        }
+        if (pack == null) {
+            return PackValidationResult.InvalidAssets("Missing pack metadata")
+        }
+        val trayFile = File(pack.trayIconPath)
+        if (!trayFile.exists() || trayFile.length() <= 0L || trayFile.length() > StickerConverter.MAX_TRAY_BYTES) {
+            return PackValidationResult.InvalidAssets("Invalid tray icon")
+        }
+        for (item in completed) {
+            val file = item.finalWebpPath?.let(::File)
+            if (file == null || StickerConverter.validateExistingWebp(file, pack.isAnimated) == null) {
+                return PackValidationResult.InvalidAssets(item.emoteName)
+            }
+        }
+        return PackValidationResult.Valid
     }
 
     fun buildAddToWhatsAppIntent(

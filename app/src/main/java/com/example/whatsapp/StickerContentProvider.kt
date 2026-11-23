@@ -9,6 +9,7 @@ import android.database.MatrixCursor
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.text.TextUtils
+import com.example.AppConfig
 import com.example.BuildConfig
 import com.example.data.local.AppDatabase
 import com.example.data.local.LocalStorageManager
@@ -96,20 +97,28 @@ class StickerContentProvider : ContentProvider() {
         }
         val segments = uri.pathSegments
         if (segments.size != 3) throw FileNotFoundException("Invalid sticker asset URI: $uri")
-        val subpackId = segments[1]
+        val packId = segments[1]
         val fileName = segments[2]
 
         val ctx = context ?: throw FileNotFoundException("Missing context")
         val db = AppDatabase.getInstance(ctx)
         val storage = LocalStorageManager(ctx)
 
-        val subpack = runBlocking { db.subpackDao().getSubpackById(subpackId) }
-            ?: throw FileNotFoundException("Subpack not found: $subpackId")
+        val pack = runBlocking { db.subpackDao().getSubpackById(packId) }
+            ?: throw FileNotFoundException("Sticker pack not found: $packId")
 
-        val file = if (fileName == "tray.png" || fileName == File(subpack.trayIconPath).name) {
-            File(subpack.trayIconPath)
+        val file = if (fileName == "tray.png" || fileName == File(pack.trayIconPath).name) {
+            File(pack.trayIconPath)
         } else {
-            storage.getStickerFile(subpack.collectionId, fileName)
+            val matchedItem = runBlocking {
+                db.stickerItemDao().getItemByCollectionAndFileName(pack.collectionId, fileName)
+            }
+            val itemFile = matchedItem?.finalWebpPath?.let(::File)
+            if (itemFile != null && itemFile.exists()) {
+                itemFile
+            } else {
+                storage.getStickerFile(pack.collectionId, fileName)
+            }
         }
 
         if (!file.exists()) {
@@ -136,27 +145,29 @@ class StickerContentProvider : ContentProvider() {
     private fun getAllPacksCursor(): Cursor {
         val ctx = context ?: return emptyMetadataCursor()
         val db = AppDatabase.getInstance(ctx)
-        val subpacks = runBlocking { db.subpackDao().getAllReadySubpacks() }
-        return buildMetadataCursor(subpacks)
+        val packs = runBlocking { db.subpackDao().getAllReadySubpacks() }
+        return buildMetadataCursor(packs)
     }
 
-    private fun getSinglePackCursor(subpackId: String): Cursor {
+    private fun getSinglePackCursor(packId: String): Cursor {
         val ctx = context ?: return emptyMetadataCursor()
         val db = AppDatabase.getInstance(ctx)
-        val subpack = runBlocking { db.subpackDao().getSubpackById(subpackId) }
-        val list = if (subpack != null && subpack.isWhatsAppReady) listOf(subpack) else emptyList()
+        val pack = runBlocking { db.subpackDao().getSubpackById(packId) }
+        val list = if (pack != null && pack.isWhatsAppReady) listOf(pack) else emptyList()
         return buildMetadataCursor(list)
     }
 
-    private fun buildMetadataCursor(subpacks: List<WhatsAppSubpackEntity>): MatrixCursor {
+    private fun buildMetadataCursor(packs: List<WhatsAppSubpackEntity>): MatrixCursor {
+        val ctx = context
+        val publisherName = if (ctx != null) AppConfig.getPackAuthor(ctx) else "EmotePack"
         val cursor = emptyMetadataCursor()
-        for (sp in subpacks) {
+        for (sp in packs) {
             val trayFileName = File(sp.trayIconPath).name.ifBlank { "tray.png" }
             cursor.addRow(
                 arrayOf<Any>(
                     sp.id,
                     sp.displayName,
-                    "EmotePack",
+                    publisherName,
                     trayFileName,
                     "",
                     "",
@@ -173,10 +184,11 @@ class StickerContentProvider : ContentProvider() {
         return cursor
     }
 
-    private fun getStickersCursor(subpackId: String): Cursor {
+    private fun getStickersCursor(packId: String): Cursor {
         val ctx = context ?: return emptyStickersCursor()
         val db = AppDatabase.getInstance(ctx)
-        val items = runBlocking { db.stickerItemDao().getCompletedItemsForSubpack(subpackId) }
+        val items = runBlocking { db.stickerItemDao().getCompletedItemsForSubpack(packId) }
+            .take(AppConfig.MAX_STICKERS_PER_COLLECTION)
         val cursor = emptyStickersCursor()
         for (item in items) {
             val fileName = item.stickerFileName

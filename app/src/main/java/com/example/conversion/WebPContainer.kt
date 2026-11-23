@@ -26,7 +26,7 @@ data class WebPInspectionResult(
 /**
  * Pure Kotlin RFC 9649 WebP RIFF container parser, animated WebP frame decoder,
  * animated WebP muxer (using Android framework's libwebp static frame encoder per keyframe),
- * and strict WhatsApp sticker validator.
+ * fake-vid motionless animated WebP builder, and strict WhatsApp sticker validator.
  */
 object WebPContainer {
 
@@ -222,24 +222,79 @@ object WebPContainer {
         lossless: Boolean = false
     ): ByteArray {
         val anmfChunks = ArrayList<ByteArray>(frames.size)
+        var anyAlpha = false
         for (frame in frames) {
             val staticBytes = encodeStaticWebP(frame.bitmap, quality, lossless)
             val payloadChunks = extractImageBitstreamChunks(staticBytes)
+            if (containsAlphaPayload(payloadChunks)) {
+                anyAlpha = true
+            }
             val duration = maxOf(8, frame.durationMs)
             val anmf = buildAnmfChunk(
                 width = width,
                 height = height,
                 durationMs = duration,
+                anmfFlags = ANMF_FLAG_DISPOSE_BG or ANMF_FLAG_NO_BLEND,
                 payloadChunks = payloadChunks
             )
             anmfChunks.add(anmf)
         }
 
+        return assembleAnimatedRiff(width, height, anyAlpha, anmfChunks)
+    }
+
+    /**
+     * Encodes a single static bitmap into a real Animated WebP ("fake-vid") containing
+     * [frameCount] identical keyframes using NO_BLEND (no disposal clear) so the sticker
+     * remains 100% visually motionless, stable on loop, and compatible with WhatsApp's
+     * animated WebP decoder.
+     */
+    fun encodeFakeVidWebP(
+        bitmap: Bitmap,
+        width: Int,
+        height: Int,
+        quality: Int,
+        lossless: Boolean = false,
+        frameCount: Int = 2,
+        frameDurationMs: Int = 500
+    ): ByteArray {
+        val staticBytes = encodeStaticWebP(bitmap, quality, lossless)
+        val payloadChunks = extractImageBitstreamChunks(staticBytes)
+        val hasAlpha = containsAlphaPayload(payloadChunks)
+        val count = maxOf(2, frameCount)
+        val duration = maxOf(8, frameDurationMs)
+
+        val anmfChunks = ArrayList<ByteArray>(count)
+        val sharedAnmf = buildAnmfChunk(
+            width = width,
+            height = height,
+            durationMs = duration,
+            anmfFlags = ANMF_FLAG_NO_BLEND,
+            payloadChunks = payloadChunks
+        )
+        repeat(count) {
+            anmfChunks.add(sharedAnmf)
+        }
+        return assembleAnimatedRiff(width, height, hasAlpha, anmfChunks)
+    }
+
+    private fun containsAlphaPayload(payloadChunks: ByteArray): Boolean =
+        containsFourCC(payloadChunks, 0, payloadChunks.size, "ALPH") ||
+            containsFourCC(payloadChunks, 0, payloadChunks.size, "VP8L")
+
+    private fun assembleAnimatedRiff(
+        width: Int,
+        height: Int,
+        hasAlpha: Boolean,
+        anmfChunks: List<ByteArray>
+    ): ByteArray {
         val bodyOut = ByteArrayOutputStream()
+        val vp8xFlags = VP8X_FLAG_ANIMATION or if (hasAlpha) VP8X_FLAG_ALPHA else 0
+
         // VP8X (10 bytes payload -> 18 bytes total chunk)
         bodyOut.write("VP8X".toByteArray(Charsets.US_ASCII))
         writeUInt32LE(bodyOut, 10)
-        bodyOut.write(VP8X_FLAG_ALPHA or VP8X_FLAG_ANIMATION)
+        bodyOut.write(vp8xFlags)
         bodyOut.write(0)
         bodyOut.write(0)
         bodyOut.write(0)
@@ -354,6 +409,7 @@ object WebPContainer {
         width: Int,
         height: Int,
         durationMs: Int,
+        anmfFlags: Int,
         payloadChunks: ByteArray
     ): ByteArray {
         val chunkPayloadSize = 16 + payloadChunks.size
@@ -365,7 +421,7 @@ object WebPContainer {
         writeUInt24LE(out, width - 1)
         writeUInt24LE(out, height - 1)
         writeUInt24LE(out, durationMs)
-        out.write(ANMF_FLAG_DISPOSE_BG or ANMF_FLAG_NO_BLEND)
+        out.write(anmfFlags)
         out.write(payloadChunks)
         if ((chunkPayloadSize and 1) == 1) out.write(0)
         return out.toByteArray()

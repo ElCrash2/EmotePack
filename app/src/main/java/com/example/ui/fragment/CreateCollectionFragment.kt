@@ -11,6 +11,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.example.AppConfig
 import com.example.AppNavigator
 import com.example.R
 import com.example.data.local.CollectionStatus
@@ -20,7 +21,8 @@ import com.example.databinding.FragmentCreateCollectionBinding
 import com.example.ui.adapter.ConversionStatusAdapter
 import com.example.ui.adapter.SelectedPreviewAdapter
 import com.example.ui.viewmodel.CreateCollectionViewModel
-import com.example.whatsapp.SubpackBuilder
+import com.example.whatsapp.StickerPackFormat
+import com.example.whatsapp.WhatsAppPackBuilder
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.launch
@@ -34,6 +36,7 @@ class CreateCollectionFragment : Fragment() {
     private lateinit var previewAdapter: SelectedPreviewAdapter
     private lateinit var statusAdapter: ConversionStatusAdapter
     private var promptedTrimItemIds = mutableSetOf<String>()
+    private var hasAutoNavigatedToSummary = false
 
     private val suggestedName: String by lazy { requireArguments().getString(ARG_SUGGESTED_NAME).orEmpty() }
     private val existingBuildId: String? by lazy { requireArguments().getString(ARG_EXISTING_COLLECTION_ID) }
@@ -49,6 +52,8 @@ class CreateCollectionFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+
+        hasAutoNavigatedToSummary = savedInstanceState?.getBoolean(KEY_AUTO_NAVIGATED, false) ?: false
 
         val isEditing = viewModel.session.editingCollectionId.value != null
         (activity as? AppNavigator)?.configureToolbar(
@@ -70,6 +75,11 @@ class CreateCollectionFragment : Fragment() {
 
         observeReviewSelection()
         observeBuildProgress()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_AUTO_NAVIGATED, hasAutoNavigatedToSummary)
     }
 
     private fun setupReviewUi(isEditing: Boolean) {
@@ -106,6 +116,7 @@ class CreateCollectionFragment : Fragment() {
                 ).show()
                 return@setOnClickListener
             }
+            hasAutoNavigatedToSummary = false
             viewModel.startBuild(name)
         }
     }
@@ -118,11 +129,37 @@ class CreateCollectionFragment : Fragment() {
         binding.rvConversionItems.adapter = statusAdapter
 
         binding.btnRetryFailed.setOnClickListener { viewModel.retryFailed() }
-        binding.btnCancelBuild.setOnClickListener { viewModel.cancelBuild() }
+        binding.btnCancelBuild.setOnClickListener { confirmCancelBuild() }
         binding.btnOpenCreatedPack.setOnClickListener {
             val id = viewModel.activeCollectionId.value ?: return@setOnClickListener
-            (activity as? AppNavigator)?.openCollectionDetail(id)
+            hasAutoNavigatedToSummary = true
+            (activity as? AppNavigator)?.openCollectionDetail(
+                collectionId = id,
+                isCreationSummary = true,
+                popCurrentProcessing = true
+            )
         }
+    }
+
+    private fun confirmCancelBuild() {
+        val colName = viewModel.activeCollectionDetails.value?.collection?.name ?: suggestedName
+        val isEdit = viewModel.session.editingCollectionId.value != null
+        val msg = getString(
+            if (isEdit) R.string.cancel_creation_edit_message else R.string.cancel_creation_new_message,
+            colName
+        )
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.cancel_creation_title)
+            .setMessage(msg)
+            .setPositiveButton(R.string.confirm_cancel_creation) { _, _ ->
+                viewModel.discardOrRevertBuild {
+                    if (isAdded) {
+                        parentFragmentManager.popBackStack()
+                    }
+                }
+            }
+            .setNegativeButton(R.string.keep_editing, null)
+            .show()
     }
 
     private fun observeReviewSelection() {
@@ -138,15 +175,14 @@ class CreateCollectionFragment : Fragment() {
                     binding.tvSummaryAnimated.text = getString(R.string.summary_animated, animCount)
                     binding.tvSummaryStatic.text = getString(R.string.summary_static, staticCount)
 
-                    val (animPacks, staticPacks) = SubpackBuilder.estimateSubpackCounts(animCount, staticCount)
-                    binding.tvWhatsappSplitInfo.text = if (animPacks > 0 && staticPacks > 0) {
-                        getString(R.string.whatsapp_split_preview_both, animPacks, staticPacks)
-                    } else {
-                        getString(R.string.whatsapp_split_preview_single, animPacks + staticPacks)
+                    binding.tvWhatsappSplitInfo.text = when (WhatsAppPackBuilder.determinePackFormat(list)) {
+                        StickerPackFormat.STATIC -> getString(R.string.pack_format_static)
+                        StickerPackFormat.ANIMATED -> getString(R.string.pack_format_animated)
+                        StickerPackFormat.MIXED_FAKE_VID -> getString(R.string.pack_format_mixed_fake_vid, list.size)
                     }
 
-                    val hasDraftGroup = (animCount in 1..2) || (staticCount in 1..2)
-                    binding.tvWhatsappDraftWarning.visibility = if (hasDraftGroup) View.VISIBLE else View.GONE
+                    val isDraft = list.size in 1 until AppConfig.MIN_STICKERS_FOR_WHATSAPP
+                    binding.tvWhatsappDraftWarning.visibility = if (isDraft) View.VISIBLE else View.GONE
                     binding.btnConfirmCreate.isEnabled = list.isNotEmpty()
                 }
             }
@@ -192,15 +228,30 @@ class CreateCollectionFragment : Fragment() {
                     )
 
                     val isRunning = details.collection.status == CollectionStatus.PROCESSING
-                    binding.btnCancelBuild.visibility = if (isRunning) View.VISIBLE else View.GONE
+                    binding.btnCancelBuild.visibility = View.VISIBLE
                     binding.btnRetryFailed.visibility = if (!isRunning && failed > 0) View.VISIBLE else View.GONE
                     binding.btnOpenCreatedPack.visibility = if (!isRunning && completed > 0) View.VISIBLE else View.GONE
 
-                    // Prompt user explicitly if any animation exceeds 10 seconds (never truncate silently)
+                    // Prompt user explicitly if any animation exceeds 10 seconds
                     val firstNeedsTrim = needsTrim.firstOrNull { it.id !in promptedTrimItemIds }
                     if (firstNeedsTrim != null && !isRunning) {
                         promptedTrimItemIds.add(firstNeedsTrim.id)
                         showTrimConfirmationDialog(firstNeedsTrim)
+                    }
+
+                    // Auto-navigate to the final Summary screen once all items finish cleanly without pending or errors
+                    val finishedCleanly = !isRunning &&
+                        pending == 0 &&
+                        needsTrim.isEmpty() &&
+                        failed == 0 &&
+                        completed > 0
+                    if (finishedCleanly && !hasAutoNavigatedToSummary) {
+                        hasAutoNavigatedToSummary = true
+                        (activity as? AppNavigator)?.openCollectionDetail(
+                            collectionId = details.collection.id,
+                            isCreationSummary = true,
+                            popCurrentProcessing = true
+                        )
                     }
                 }
             }
@@ -232,6 +283,7 @@ class CreateCollectionFragment : Fragment() {
     companion object {
         private const val ARG_SUGGESTED_NAME = "suggested_name"
         private const val ARG_EXISTING_COLLECTION_ID = "existing_collection_id"
+        private const val KEY_AUTO_NAVIGATED = "auto_navigated"
 
         fun newForSelection(suggestedName: String) = CreateCollectionFragment().apply {
             arguments = Bundle().apply {

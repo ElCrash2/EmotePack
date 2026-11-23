@@ -27,8 +27,14 @@ data class SevenTvEmote(
     val highResUrl: String,
     val fallbackUrls: List<String> = emptyList(),
     val sourceSetId: String? = null,
-    val sourceSetName: String? = null
-) : Serializable
+    val sourceSetName: String? = null,
+    val updatedAt: Long = 0L,
+    val originalFormat: String = "",
+    val localPreviewPath: String? = null
+) : Serializable {
+    val versionKey: String
+        get() = "${updatedAt}_${highResUrl.hashCode()}"
+}
 
 data class SevenTvEmoteSet(
     val id: String,
